@@ -5,6 +5,18 @@ name = "pypi"
 
 [packages]
 jupyter = "*"
+pandas = "*"
+opencv-python = "*"
+ipykernel = "*"
+pillow = "*"
+matplotlib = "*"
+torchvision = "*"
+seaborn = "*"
+colorthief = "*"
+torch = "*"
+torchaudio = "*"
+segmentation-models-pytorch = "*"
+albumentations = "*"
 
 [dev-packages]
 
