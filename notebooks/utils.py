@@ -1,24 +1,22 @@
-from __future__ import print_function, division
-import os
+from torchvision import models
+from PIL import Image, ImageDraw
+import matplotlib.pyplot as plt
+import torchvision.transforms as T
+from torch.utils.data import Dataset, DataLoader
+import json
+import segmentation_models_pytorch as smp
 import torch
 import pandas as pd
-from skimage import io, transform
 import numpy as np
-import matplotlib.pyplot as plt
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms, utils
-import json
+import os
+import cv2
+import shutil
+import functools
 
-# Ignore warnings
-import warnings
-warnings.filterwarnings("ignore")
+class BitmojiDataset(Dataset):
+    """Bitmoji dataset."""
 
-plt.ion()   # interactive mode
-
-class FaceLandmarksDataset(Dataset):
-    """Face Landmarks dataset."""
-
-    def __init__(self, csv_file, root_dir, transform=None):
+    def __init__(self, csv_file, root_dir, resize=None, transform=None, augmentation=None, copies=None):
         """
         Args:
             csv_file (string): Path to the csv file with annotations.
@@ -26,112 +24,99 @@ class FaceLandmarksDataset(Dataset):
             transform (callable, optional): Optional transform to be applied
                 on a sample.
         """
-        self.landmarks_frame = pd.read_csv(csv_file)
+        self.bitmoji_frame = pd.read_csv(csv_file)
         self.root_dir = root_dir
+        self.resize = resize
         self.transform = transform
+        self.augmentation = augmentation
+        self.copies = copies
 
     def __len__(self):
-        return len(self.landmarks_frame)
+        if self.copies:
+            return self.bitmoji_frame.shape[0] * self.copies
+        else:
+            return self.bitmoji_frame.shape[0]
 
     def __getitem__(self, idx):
         if torch.is_tensor(idx):
             idx = idx.tolist()
+            
+        if self.copies:
+            idx = idx % self.bitmoji_frame.shape[0]
 
         img_name = os.path.join(self.root_dir,
-                                self.landmarks_frame.iloc[idx, 0])
-        image = io.imread(img_name)        
-        landmarks = json.loads(self.landmarks_frame.iloc[idx, 5])
-        try:
-            landmarks = np.array(list(zip(landmarks['all_points_x'],landmarks['all_points_y'])))
-        except:
-            landmarks = np.array([]).reshape(-1, 2)
+                                self.bitmoji_frame.iloc[idx, 0])
+        image = cv2.imread(img_name)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        shape = image.shape
+                
+        bitmoji = self.bitmoji_frame.loc[idx, 'region_shape_attributes']
+        mask = get_mask(bitmoji, shape[:2])
+        mask = mask / 255 # normalise
+        # mask = np.stack(masks, axis=-1).astype('float')
         
-        
-        sample = {'image': image, 'landmarks': landmarks}
-
+        if self.resize is not None:
+            image, mask = cv2.resize(image, (320, 480)), cv2.resize(mask, (320, 480))
+            mask = mask.reshape((*mask.shape, 1))
+            
+        if self.augmentation:
+            sample = self.augmentation(image=image, mask=mask)
+            image, mask = sample['image'], sample['mask']
+            
         if self.transform:
-            sample = self.transform(sample)
+            sample = self.transform(image=image, mask=mask)
+            image, mask = sample['image'], sample['mask']
+        
+        return image, mask
 
-        return sample
+def get_mask(row, shape):
+    row = json.loads(row)
+    mask = np.zeros((*shape, 1))
+    try:
+        coords = np.array([[x,y] for x, y in zip(row['all_points_x'], row['all_points_y'])])
+        cv2.fillPoly(mask, [coords], 255)
+        
+    except:
+        pass
+    return mask
 
-class Rescale(object):
-    """Rescale the image in a sample to a given size.
+def visualize(**images):
+    """PLot images in one row."""
+    n = len(images)
+    plt.figure(figsize=(16, 9))
+    for i, (name, image) in enumerate(images.items()):
+        plt.subplot(1, n, i + 1)
+        plt.xticks([])
+        plt.yticks([])
+        plt.title(' '.join(name.split('_')).title(), color='white')
+        plt.imshow(image)
+    plt.show()
 
+
+import albumentations as albu
+def get_preprocessing(preprocessing_fn):
+    """Construct preprocessing transform
+    
     Args:
-        output_size (tuple or int): Desired output size. If tuple, output is
-            matched to output_size. If int, smaller of image edges is matched
-            to output_size keeping aspect ratio the same.
+        preprocessing_fn (callbale): data normalization function 
+            (can be specific for each pretrained neural network)
+    Return:
+        transform: albumentations.Compose
+    
     """
+    
+    _transform = [
+        albu.Lambda(image=preprocessing_fn),
+        albu.Lambda(image=to_tensor, mask=to_tensor),
+    ]
+    return albu.Compose(_transform)
 
-    def __init__(self, output_size):
-        assert isinstance(output_size, (int, tuple))
-        self.output_size = output_size
+def get_validation_augmentation():
+    """Add paddings to make image shape divisible by 32"""
+    test_transform = [
+        albu.PadIfNeeded(320, 320)
+    ]
+    return albu.Compose(test_transform)
 
-    def __call__(self, sample):
-        image, landmarks = sample['image'], sample['landmarks']
-
-        h, w = image.shape[:2]
-        if isinstance(self.output_size, int):
-            if h > w:
-                new_h, new_w = self.output_size * h / w, self.output_size
-            else:
-                new_h, new_w = self.output_size, self.output_size * w / h
-        else:
-            new_h, new_w = self.output_size
-
-        new_h, new_w = int(new_h), int(new_w)
-
-        img = transform.resize(image, (new_h, new_w))
-
-        # h and w are swapped for landmarks because for images,
-        # x and y axes are axis 1 and 0 respectively
-        landmarks = landmarks * [new_w / w, new_h / h]
-
-        return {'image': img, 'landmarks': landmarks}
-
-
-class RandomCrop(object):
-    """Crop randomly the image in a sample.
-
-    Args:
-        output_size (tuple or int): Desired output size. If int, square crop
-            is made.
-    """
-
-    def __init__(self, output_size):
-        assert isinstance(output_size, (int, tuple))
-        if isinstance(output_size, int):
-            self.output_size = (output_size, output_size)
-        else:
-            assert len(output_size) == 2
-            self.output_size = output_size
-
-    def __call__(self, sample):
-        image, landmarks = sample['image'], sample['landmarks']
-
-        h, w = image.shape[:2]
-        new_h, new_w = self.output_size
-
-        top = np.random.randint(0, h - new_h)
-        left = np.random.randint(0, w - new_w)
-
-        image = image[top: top + new_h,
-                      left: left + new_w]
-
-        landmarks = landmarks - [left, top]
-
-        return {'image': image, 'landmarks': landmarks}
-
-
-class ToTensor(object):
-    """Convert ndarrays in sample to Tensors."""
-
-    def __call__(self, sample):
-        image, landmarks = sample['image'], sample['landmarks']
-
-        # swap color axis because
-        # numpy image: H x W x C
-        # torch image: C x H x W
-        image = image.transpose((2, 0, 1))
-        return {'image': torch.from_numpy(image),
-                'landmarks': torch.from_numpy(landmarks)}
+def to_tensor(x, **kwargs):
+    return x.transpose(2, 0, 1).astype('float32')

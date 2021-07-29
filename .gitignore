@@ -129,3 +129,6 @@ dmypy.json
 .pyre/
 
 data/training
+data/train
+data/images
+data/test_images
